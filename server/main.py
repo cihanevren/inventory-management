@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
-from pydantic import BaseModel
+from datetime import datetime, timedelta
+from pydantic import BaseModel, Field
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -89,6 +90,15 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float
+    lead_time_days: int
+
+class RestockLine(BaseModel):
+    item_sku: str
+    quantity: int = Field(gt=0)
+
+class CreateRestockOrderRequest(BaseModel):
+    items: List[RestockLine] = Field(min_length=1)
 
 class BacklogItem(BaseModel):
     id: str
@@ -303,6 +313,47 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+# Restocking orders (in-memory, reset on server restart)
+restock_orders: list = []
+
+@app.get("/api/restock-orders")
+def get_restock_orders():
+    """Get submitted restocking orders, newest first"""
+    return list(reversed(restock_orders))
+
+@app.post("/api/restock-orders", status_code=201)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Submit a restocking order for demand-forecast items"""
+    forecasts = {f["item_sku"]: f for f in demand_forecasts}
+    lines = []
+    for line in request.items:
+        forecast = forecasts.get(line.item_sku)
+        if not forecast:
+            raise HTTPException(status_code=400, detail=f"Unknown SKU: {line.item_sku}")
+        lines.append({
+            "item_sku": line.item_sku,
+            "item_name": forecast["item_name"],
+            "quantity": line.quantity,
+            "unit_cost": forecast["unit_cost"],
+            "line_total": round(line.quantity * forecast["unit_cost"], 2),
+            "lead_time_days": forecast["lead_time_days"],
+        })
+
+    submitted = datetime.now()
+    lead_time = max(l["lead_time_days"] for l in lines)
+    order = {
+        "id": str(len(restock_orders) + 1),
+        "order_number": f"RST-{submitted.year}-{len(restock_orders) + 1:04d}",
+        "submitted_date": submitted.isoformat(timespec="seconds"),
+        "items": lines,
+        "total_cost": round(sum(l["line_total"] for l in lines), 2),
+        "lead_time_days": lead_time,
+        "expected_delivery": (submitted + timedelta(days=lead_time)).isoformat(timespec="seconds"),
+        "status": "Submitted",
+    }
+    restock_orders.append(order)
+    return order
 
 if __name__ == "__main__":
     import uvicorn
